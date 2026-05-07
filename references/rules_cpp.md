@@ -140,3 +140,41 @@ fields are used without checking whether they are set/valid (proto3 fields have 
 won't fail deserialization even if missing).  
 **Natural language**: Look for protobuf message fields accessed directly without checking
 `has_field()` or validating the value makes sense (e.g., size > 0, index in range).
+
+---
+
+## CPP-016 — Unsafe Column Sharing / Column Reuse Causing Crash
+**Severity**: HIGH  
+**Pattern** (StarRocks-specific): A `Column` (especially a `NullColumn` inside a `NullableColumn`)
+is shared between multiple owners — e.g. two `NullableColumn`s share the same `NullColumn`, two
+slots in a `Chunk` share the same `Column`, or different `Chunk`s share the same `Column` — so that
+later in-place mutation of one (filter, append, resize, assign_value) silently corrupts the others
+and triggers `Check failed: _data_column->size() == _null_column->size()` or similar size/state
+mismatches.
+
+**Common unsafe patterns to flag**:
+1. `std::move(*nullable->null_column()).mutate()` or
+   `std::move(*nullable->data_column()).mutate()` — when the source `ColumnPtr`'s `use_count == 1`
+   the COW `mutate()` returns the **same** object instead of cloning, so the resulting
+   `MutableColumnPtr` aliases the input's null/data column. The safe replacement is
+   `Column::mutate(nullable->null_column())` (or `NullColumn::static_pointer_cast(Column::mutate(...))`),
+   which takes a `ColumnPtr` by value, bumps `use_count >= 2`, and forces a clone.
+2. Building a `NullableColumn` (or any composite column) by directly reusing another column's
+   internal `null_column()` / `data_column()` pointer without going through `Column::mutate(...)` or
+   an explicit `clone()`.
+3. Putting the same `ColumnPtr` into two different slot positions of a single `Chunk`, or appending
+   the result of an expression that returned an aliased column from the input chunk as a new slot
+   (e.g. expression evaluators like `map_apply`, `array_length`, `array_*`, `map_*`, binary
+   functions, `ngram` that derive a result column from an input's null/data column).
+4. Caching a `ColumnPtr` across chunks (member field, static, captured by lambda) and then handing
+   it back into a new `Chunk` whose downstream operators may filter/resize it.
+
+**Natural language**: In StarRocks BE expression / function code, flag any place that obtains a
+mutable child column from a `NullableColumn` (or other composite column) via
+`std::move(*x->null_column()).mutate()` / `std::move(*x->data_column()).mutate()` — recommend
+`Column::mutate(x->null_column())` instead. Also flag constructions where a new `NullableColumn` /
+chunk slot is built that reuses an input column's `null_column()` or `data_column()` pointer
+directly. Be suspicious of any code path that produces a result column for a new slot in the same
+`Chunk` while structurally sharing storage with an existing slot — downstream `Chunk::filter`,
+`append`, `resize`, or per-column mutation will desynchronize sizes and crash. Reference fix:
+StarRocks PR #71258 (and #71207).
