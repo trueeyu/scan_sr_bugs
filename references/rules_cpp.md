@@ -178,3 +178,56 @@ directly. Be suspicious of any code path that produces a result column for a new
 `Chunk` while structurally sharing storage with an existing slot — downstream `Chunk::filter`,
 `append`, `resize`, or per-column mutation will desynchronize sizes and crash. Reference fix:
 StarRocks PR #71258 (and #71207).
+
+---
+
+## CPP-017 — Thread Name Exceeds pthread_setname_np 15-Character Limit
+**Severity**: LOW
+**Pattern** (StarRocks-specific): A thread (or thread-pool / scanner / compaction / bthread / loader
+worker) is created with a `name` string whose length is **>= 16 characters**. On Linux,
+`pthread_setname_np` restricts the name to 16 bytes **including** the terminating null byte, i.e.
+at most **15 visible characters**. When the limit is exceeded:
+
+1. `Thread::set_thread_name()` in `be/src/common/thread/thread.cpp` truncates the name in place by
+   doing `str.at(15) = '\0'` — this writes a NUL into the middle of a `std::string` but does NOT
+   shrink `size()`, leaving an embedded NUL inside the buffer.
+2. `pthread_setname_np` is then called with that buffer; on some kernels / glibc versions the call
+   still returns non-zero (`ERANGE`), and `Thread::set_thread_name` falls through to
+   `LOG(WARNING) << "failed to set thread name: " << name;`.
+3. Because `name` (and/or the truncated `str`) contains the embedded NUL, the warning prints with a
+   trailing `^@` byte, producing log lines like:
+
+   ```
+   W20260518 14:43:15.781343 23109709274176 thread.cpp:279] failed to set thread name: compact_data_di^@
+   ```
+
+   These warnings are noisy, can mask real issues during incident triage, and indicate the thread
+   is running with a truncated / mis-labeled name (making `top -H`, `pstack`, perf, and gdb harder
+   to read).
+
+**Common unsafe patterns to flag**:
+1. Any call to `Thread::set_thread_name(...)`, `pthread_setname_np(...)`, `bthread_setname(...)`,
+   `prctl(PR_SET_NAME, ...)` where the second argument is a string literal of **16 or more**
+   characters, e.g. `"compact_data_directory"`, `"segment_replicate_executor"`,
+   `"async_delta_writer_pool"`.
+2. `ThreadPoolBuilder("...").set_...` / `Thread::create("category", "name", ...)` /
+   `ThreadPool::set_min_threads(... ,"name")` where the `name` argument (the per-worker name, not
+   the category) is a literal with `length() >= 16`. The category is fine; the worker name is what
+   gets passed down to `pthread_setname_np`.
+3. Names built by concatenation that obviously exceed 15 chars at compile time, e.g.
+   `"compact_data_" + dir_suffix` where the prefix alone is 13 chars and the suffix is non-empty
+   and bounded (`"_directory"`, partition id, etc.). Flag if any reasonably-sized suffix pushes the
+   total past 15.
+4. Reusing a long human-readable subsystem name (`"PublishVersionDaemon"`,
+   `"LakeTabletScheduler"`) directly as the worker thread name instead of a short abbreviation.
+
+**Natural language**: Scan for any string literal or easily-bounded string expression that is
+passed as a thread/worker/bthread name (function names containing `set_thread_name`,
+`setname_np`, `set_name`, `set_worker_name`, `prctl(PR_SET_NAME`, or the `name` field of
+`ThreadPoolBuilder`, `Thread::create`, `std::thread` wrappers, scanner/compaction worker
+constructors, brpc `bthread` task names). If the resulting name is >= 16 characters, report it —
+suggest shortening to <= 15 chars (e.g. `compact_data_directory` → `compact_dir`,
+`segment_replicate_executor` → `seg_replicate`). Do **not** flag names <= 15 chars. Do not flag
+the *category* argument of `Thread::create(category, name, ...)` — only the per-thread `name`.
+Reference symptom: warning lines from `be/src/common/thread/thread.cpp` of the form
+`failed to set thread name: <name>^@`.
