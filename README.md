@@ -14,7 +14,8 @@ scan_sr_bugs/
 ├── references/
 │   ├── rules_common.md         # Rules applicable to both C++ and Java
 │   ├── rules_cpp.md            # C++-specific rules
-│   └── rules_java.md           # Java-specific rules
+│   ├── rules_java.md           # Java-specific rules
+│   └── rules_optimizer.md      # StarRocks FE optimizer rules (OPT-NNN)
 └── README.md
 ```
 
@@ -29,7 +30,9 @@ Invoke the skill by providing a C++ or Java source file path and asking for a sc
 The scanner will:
 
 1. Read the file and detect the language by extension (`.cpp`/`.h`/`.cc` → C++, `.java` → Java).
-2. Load `references/rules_common.md` plus the language-specific rules file.
+2. Load `references/rules_common.md` plus the language-specific rules file, and
+   `references/rules_optimizer.md` when the Java file is under the StarRocks FE optimizer
+   packages (`com.starrocks.sql.optimizer` / `com.starrocks.qe.feedback`).
 3. Apply each rule and collect findings.
 4. Emit a structured report listing findings with severity, rule ID, line numbers, code excerpt, explanation, and suggestion.
 
@@ -46,5 +49,6 @@ See `SKILL.md` for the full output template.
 - Add cross-language rules to `references/rules_common.md` (`CMN-NNN`).
 - Add C++ rules to `references/rules_cpp.md` (`CPP-NNN`).
 - Add Java rules to `references/rules_java.md` (`JAVA-NNN`).
+- Add StarRocks FE optimizer rules to `references/rules_optimizer.md` (`OPT-NNN`).
 
 Each rule should include an ID, severity, description, and where possible a code example illustrating the bug pattern.
