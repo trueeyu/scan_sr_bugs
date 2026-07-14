@@ -65,3 +65,7 @@ return newJoinOperator;
 Note the systemic sibling of this bug: `Operator.Builder.withOperator()` copies
 `limit`/`predicate`/`projection` but not `predicateCommonOperators`, so any Builder-based
 reconstruction that runs after `ScalarOperatorsReuseRule` can reintroduce the same failure.
+
+**Found by this rule** — StarRocks PR #76330 (https://github.com/StarRocks/starrocks/pull/76330):
+scanned out with this OPT-001 rule. `SkewShuffleJoinEliminationRule` rebuilt `PhysicalHashJoinOperator`
+copying `predicate` but dropping `predicateCommonOperators`.
