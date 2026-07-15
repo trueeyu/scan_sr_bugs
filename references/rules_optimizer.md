@@ -69,3 +69,8 @@ reconstruction that runs after `ScalarOperatorsReuseRule` can reintroduce the sa
 **Found by this rule** — StarRocks PR #76330 (https://github.com/StarRocks/starrocks/pull/76330):
 scanned out with this OPT-001 rule. `SkewShuffleJoinEliminationRule` rebuilt `PhysicalHashJoinOperator`
 copying `predicate` but dropping `predicateCommonOperators`.
+
+**Found by this rule** — StarRocks PR #76388 (https://github.com/StarRocks/starrocks/pull/76388):
+scanned out with this OPT-001 rule (the systemic sibling above). `Operator.Builder.withOperator()`
+copied `predicate` but not `predicateCommonOperators`, dropping it on every builder-based operator
+copy across the optimizer.
