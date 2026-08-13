@@ -231,3 +231,60 @@ suggest shortening to <= 15 chars (e.g. `compact_data_directory` → `compact_di
 the *category* argument of `Thread::create(category, name, ...)` — only the per-thread `name`.
 Reference symptom: warning lines from `be/src/common/thread/thread.cpp` of the form
 `failed to set thread name: <name>^@`.
+
+---
+
+## CPP-018 — Captured Status Discarded in Favor of a Hardcoded Success Return
+**Severity**: HIGH
+**Pattern** (StarRocks-specific): A function returning `Status` calls something that can fail and
+captures the result into a local (`auto res = ...;` / `Status st = ...;`), but the function's actual
+`return` statement is a hardcoded success (`return Status::OK();`) instead of the captured variable.
+The variable is written but never read, so any error the callee reports — spill failure, closed
+exchanger, backpressure, RPC failure — is silently swallowed and execution proceeds as if it had
+succeeded. This is easy to miss on a quick read because the status *looks* handled (it's captured
+into a named variable, not dropped outright), but the capture is dead.
+
+This is distinct from CMN-003 (return value never captured at all — discarded outright with no
+variable) and CMN-006 (error handling present but inconsistent across branches): here there is a
+single straight-line path where the value is captured and then unconditionally overridden by a
+hardcoded success before returning.
+
+**Common unsafe patterns to flag**:
+1. `auto res = <fallible_call>(...); ... return Status::OK();` (or any other hardcoded
+   success/default status) where `res` is never referenced between its assignment and the function's
+   return.
+2. Pipeline operator methods (`push_chunk`, `pull_chunk`, `set_finishing`, `process_chunk`, `send`,
+   `close`) that capture an exchanger/channel/sink call's `Status` and then return a fixed value
+   instead of propagating it.
+3. A sibling/peer implementation (another operator class for a different exchange strategy, an
+   overload, a near-duplicate function) that correctly `return`s the captured status — making this
+   instance a copy-paste regression relative to the established pattern.
+
+**Natural language**: In functions returning `Status` (or an equivalent result type), find calls that
+can fail and are captured into a local variable, then check whether that variable is actually used
+before the function returns — if the function instead returns a different, hardcoded success value,
+flag it: the error path is being dropped. When present, cross-check sibling/peer classes or overloads
+performing the same kind of call to see whether they correctly propagate the status, which both
+confirms the bug and shows the expected fix.
+
+**Reference fix — StarRocks PR #77737** (https://github.com/StarRocks/starrocks/pull/77737):
+`GroupedExecutionSinkOperator::push_chunk()` captured `_exchanger->accept()`'s return value into
+`res` but then unconditionally `return Status::OK();`, silently swallowing any error the exchanger
+reported (e.g. spill failures, closed-exchanger states). The sibling
+`LocalExchangeSinkOperator::push_chunk()` already returned this value correctly, exposing the
+inconsistency.
+```cpp
+// BEFORE (buggy) — res captured but never returned
+Status GroupedExecutionSinkOperator::push_chunk(RuntimeState* state, const ChunkPtr& chunk) {
+    auto res = _exchanger->accept(chunk, _driver_sequence);
+    _peak_memory_usage_counter->set(_exchanger->get_memory_usage());
+    return Status::OK();
+}
+
+// AFTER (fixed) — propagate the captured status
+Status GroupedExecutionSinkOperator::push_chunk(RuntimeState* state, const ChunkPtr& chunk) {
+    auto res = _exchanger->accept(chunk, _driver_sequence);
+    _peak_memory_usage_counter->set(_exchanger->get_memory_usage());
+    return res;
+}
+```
