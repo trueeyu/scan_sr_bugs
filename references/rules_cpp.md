@@ -371,3 +371,16 @@ if (add_status.ok()) {
 delete fetch_data;
 return add_status;
 ```
+
+**Candidate instances found by this rule** (scan of `be/src` @ `5d1ed54fdca`, 2026-08-31):
+- `be/src/storage/tablet.cpp:539` — `Tablet::_prepare_binlog_if_needed()` checks `!st.ok()`
+  (`rowset->load()`, already checked at L522, so provably OK) instead of `status`,
+  the result of `BinlogBuilder::build_duplicate_key()` on L538. `status` is never read: on a binlog
+  build failure the `abort_ingestion()` + `rowset->close()` branch is dead, the function returns
+  `true`, and the caller `precommit_ingestion()`s and later `_commit_binlog()`s a partially built
+  binlog. Introduced by #16729. **Unfixed.**
+- Adjacent (CPP-018 shape, status captured and never read at all):
+  `be/src/storage_primitive/in_predicate_utils.h:172` — `strings_to_hashset()` drops
+  `type_info->from_string(&v, s)`'s status and `emplace`s a possibly-uninitialized `v`;
+  `be/src/tools/meta_tool.cpp:1131` — `load_tablet_status` from `TabletMetaManager::walk()` unused
+  (debug tool, LOW).
