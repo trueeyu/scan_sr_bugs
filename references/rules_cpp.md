@@ -288,3 +288,86 @@ Status GroupedExecutionSinkOperator::push_chunk(RuntimeState* state, const Chunk
     return res;
 }
 ```
+
+---
+
+## CPP-019 — Wrong/Stale `Status` Variable Checked, Skipping Manual Cleanup
+**Severity**: HIGH
+**Pattern** (StarRocks-specific): Two or more status-like objects are live in the same scope — a
+stale one from an earlier step (`status`, `st`, `res`, often a `StatusOr` that has already been
+checked and whose value has been `std::move`d out) and a fresh one from the call that actually
+matters (`add_status`, `send_status`, `write_status`). The subsequent `if (...)` branch tests the
+**stale** variable instead of the fresh one. Because the stale variable is known-OK at that point,
+the success branch is taken unconditionally, and the failure branch — which is where the manual
+cleanup lives (`delete`, `release`, `close`, `unref`, counter rollback) — becomes dead code. The
+function still `return`s the correct `add_status`, so the error is reported upward and the mistake
+does not show up in status propagation tests: the only visible symptom is a leak (or a
+double-counted metric) under the error path.
+
+The leak is usually enabled by a raw-pointer ownership handoff: an owning `unique_ptr` is
+`release()`d into a callee that deletes the pointer **only on success**, leaving the caller
+responsible for deleting it on failure.
+
+This is the C++/`Status` specialization of CMN-010 (wrong variable) crossed with CMN-001 (leak on
+early return): the tell is not a missing check but a check on the *wrong, already-consumed* status.
+
+**Common unsafe patterns to flag**:
+1. `auto status = f(); if (!status.ok()) return ...; ... auto add_status = g(p); if (status.ok()) { ... }`
+   — the second `if` re-tests the first variable. Any `if`/`RETURN_IF_ERROR`/`DCHECK` on a status
+   variable that was **already** checked and cannot have changed since is a bug or dead code.
+2. A `StatusOr` whose value has been consumed (`std::move(status.value())`, `status.value_or_die()`)
+   and which is then tested again — a moved-from `StatusOr` is a stale object; nothing after the move
+   can make it not-OK.
+3. `auto* p = uptr.release();` (or `new`) followed by a call documented as "deletes the pointer if
+   status is OK", where the `delete p;` sits only inside a branch guarded by the wrong status.
+4. Success-only side effects (`_written_rows += num_rows;`, `COUNTER_UPDATE`, `_num_sent++`) executed
+   under a condition that does not correspond to the operation whose success they claim to record.
+
+**NOT a bug** (do not flag):
+- Re-testing a status variable that is genuinely reassigned in between.
+- A single status variable reused across steps where each `if` follows its own assignment.
+- Cleanup handled by RAII (`unique_ptr`/`DeferOp`/`ScopeGuard`) rather than a branch — there the
+  wrong condition may still be a metric bug but not a leak.
+
+**Natural language**: When a function holds more than one status object, match each `if (x.ok())` /
+`if (!x.ok())` to the *most recent* fallible call before it, and verify the variable tested is the one
+that call wrote. Pay special attention when the names are near-duplicates (`status` vs `add_status`)
+or when one of them is a `StatusOr` that has already been unwrapped — those read as correct at a
+glance. Then check what lives in the branch that becomes unreachable: if it contains `delete`,
+a close/unref, or an error log, the bug is a resource leak on the error path, not just a wrong log.
+Suggested fix: test the fresh status variable, and prefer `unique_ptr`/RAII over a raw pointer whose
+deletion is split between callee-on-success and caller-on-failure.
+
+**Reference fix — StarRocks PR #11472** (https://github.com/StarRocks/starrocks/pull/11472):
+`MysqlResultWriter::append_chunk()` released the `TFetchDataResultPtr` into
+`BufferControlBlock::add_batch()` (which deletes it only on success), then branched on `status` — the
+already-checked, already-moved-from `StatusOr` from `_process_chunk()` — instead of `add_status`.
+When `add_batch` failed (`Cancelled: Cancelled BufferControlBlock::add_batch`, seen on query
+cancel/fragment close), the OK branch was still taken, so `delete fetch_data` never ran and
+`_written_rows` was inflated by rows that were never sent.
+```cpp
+// BEFORE (buggy) — branches on the stale `status`, so `delete fetch_data` is unreachable
+auto status = _process_chunk(chunk);                 // StatusOr, already checked above
+TFetchDataResultPtr result = std::move(status.value());
+auto* fetch_data = result.release();
+// Note: this method will delete result pointer if status is OK
+auto add_status = _sinker->add_batch(fetch_data);
+if (status.ok()) {                                   // BUG: always true
+    _written_rows += num_rows;
+    return add_status;
+} else {
+    LOG(WARNING) << "append result batch to sink failed.";
+}
+delete fetch_data;
+return add_status;
+
+// AFTER (fixed) — branch on the status produced by add_batch
+if (add_status.ok()) {
+    _written_rows += static_cast<int64_t>(num_rows);
+    return add_status;
+} else {
+    LOG(WARNING) << "append result batch to sink failed.";
+}
+delete fetch_data;
+return add_status;
+```
