@@ -120,6 +120,13 @@ callOperator = new CallOperator(FunctionSet.DAYOFMONTH, FloatType.DOUBLE, Lists.
 // duplicate RAND block deleted
 ```
 
+**Found by this rule** — StarRocks PR #79094 (https://github.com/StarRocks/starrocks/pull/79094):
+scanned out with this TEST-001 rule over all ~2000 `fe/` test sources. 15 sites in 13 files: three
+self-comparisons, five over-wide float deltas, six tests made unfailable by their `catch` block —
+and, found only while fixing them, three assertions whose **expected value was itself wrong**
+(`ExpressionStatisticsCalculatorTest`'s `hours_diff` / `days_diff` / `datediff` asserted `0` where
+the calculator returns `-0.0833` / `-0.0035`), the inflated delta being what kept them green.
+
 **Candidate instances found by this rule** (scan of `fe/` test sources @ `d4bbe0d9943`, 2026-09-14).
 Line numbers are at that commit. All were fixed in **StarRocks PR #79094**
 (https://github.com/StarRocks/starrocks/pull/79094); the entries below are the findings **as first
