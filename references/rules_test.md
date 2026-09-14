@@ -87,3 +87,82 @@ Assertions.assertEquals(100, columnStatistic.getDistinctValuesCount(), 0.001);
 callOperator = new CallOperator(FunctionSet.DAYOFMONTH, FloatType.DOUBLE, Lists.newArrayList(columnRefOperator));
 // duplicate RAND block deleted
 ```
+
+**Candidate instances found by this rule** (scan of `fe/` test sources @ `d4bbe0d9943`, 2026-09-14).
+All are **unfixed**; line numbers are at that commit.
+
+*Shape 1 — assertion compares a constant to itself, so the real value is never checked:*
+- `fe/fe-core/src/test/java/com/starrocks/service/InformationSchemaDataSourceTest.java:509-511` —
+  `assertEquals("NO", "NO", "isGrantable should be NO")` ×3. The three neighbouring lines assert
+  `adminRole.getUser()` / `getHost()`; these three should assert `adminRole.getIs_grantable()`,
+  `getIs_default()`, `getIs_mandatory()` (fields 7-9 of `TApplicableRolesInfo` in
+  `FrontendService.thrift`). Those three columns of `information_schema.applicable_roles` have no
+  coverage at all.
+- `fe/fe-core/src/test/java/com/starrocks/common/PropertyAnalyzerTest.java:256` —
+  `assertEquals(true, true)` right after
+  `enablePeristentIndex = PropertyAnalyzer.analyzeEnablePersistentIndex(property5);`. Every sibling
+  case (L243, L251, L261) asserts `enablePeristentIndex`. The "explicit `true` while
+  `enable_persistent_index_by_default = false`" case is unverified — exactly the PR #78430 shape.
+- `fe/fe-core/src/test/java/com/starrocks/common/lock/YieldableLockTest.java:81` —
+  `assertEquals(lock.getHeldTimeNs(), lock.getHeldTimeNs())` under the comment "After close() the
+  total is stable". Both calls are in one expression, so a still-ticking counter would not be
+  caught; should snapshot the value, wait, then compare. LOW.
+
+*Shape 2 — float `delta` wide enough to swallow the value:*
+- `fe/fe-core/src/test/java/com/starrocks/sql/optimizer/rewrite/ScalarOperatorFunctionsTest.java:1136`
+  — `assertEquals(1.0, divideDouble(O_DOUBLE_100, O_DOUBLE_100).getDouble(), 1)` accepts `[0, 2]`;
+  `divideDouble(100, 100)` returning 0 or 2 passes. Sibling `divideDecimal`/`multiplyLargeInt` use
+  exact comparison.
+- `.../ScalarOperatorFunctionsTest.java:1040` — `assertEquals(0.0, subtractDouble(100, 100), 1)`
+  accepts `[-1, 1]`; `subtractInt`/`subtractBigInt` next to it use the exact 2-arg form.
+- `fe/fe-core/src/test/java/com/starrocks/sql/optimizer/rewrite/DefaultPredicateSelectivityEstimatorTest.java:546`
+  — `assertEquals(estimate(dtGe2, statistics), 0.002, 0.1)` accepts `[-0.098, 0.102]`, i.e. any
+  plausible selectivity. The symmetric `dtGt2` line (L540) uses delta `0.001`; the whole file passes
+  *actual* first, which is what lets a stray delta go unnoticed.
+- `fe/fe-core/src/test/java/com/starrocks/analysis/CreateMaterializedViewTest.java:674` —
+  `assertEquals(1, tableProperty.getReplicationNum().shortValue(), 1)` accepts a replication num of
+  0, 1 or 2. Every other assertion in the block uses the 2-arg form; the trailing `1` is a stray.
+- `fe/fe-core/src/test/java/com/starrocks/sql/optimizer/statistics/ExpressionStatisticsCalculatorTest.java:619,620,625,630`
+  — `hours_diff` / `minutes_diff` / `seconds_diff` min/max asserted against `0` with delta `1`, while
+  the adjacent `days_diff` / `datediff` use `0.01` and `mod` uses `0.001`. LOW.
+
+*Related shape — the `catch` block makes the test unfailable* (same "what change would make this
+fail? none" test, worth folding into TEST-001 when scanning):
+- `fe/fe-core/src/test/java/com/starrocks/sql/parser/ParserTest.java:323-328` and
+  `fe/fe-core/src/test/java/com/starrocks/sql/util/TestUtil.java:97-101` — `Assertions.fail();`
+  inside `try`, with an **empty** `catch (Throwable)`. `fail()` throws `AssertionFailedError`, which
+  *is* a `Throwable`, so the catch swallows the failure: `setLargeDecimalUnderlyingType("foobar")`
+  and `add()` after `seal()` can silently succeed and the test still passes. Use
+  `assertThrows(...)`, or narrow the catch to the expected exception type.
+- `fe/fe-core/src/test/java/com/starrocks/catalog/TableFunctionTableTest.java:167-168` and
+  `fe/plugin/spark-dpp/src/test/java/com/starrocks/load/loadv2/dpp/DppUtilsTest.java:141-142` —
+  `catch (Exception e) { Assertions.assertFalse(false); }`. Any exception from the code under test
+  is swallowed by an assertion that always passes.
+- `fe/fe-core/src/test/java/com/starrocks/qe/StmtExecutorNewTest.java:115-120` —
+  comment says "This should not throw exception even if planning fails", but the `catch` asserts
+  `assertTrue(true)`, so both outcomes pass.
+- `fe/fe-core/src/test/java/com/starrocks/connector/iceberg/IcebergApiConverterTest.java:635-640` —
+  `catch (DdlException e) { assertTrue(true); }` followed by `assertEquals(sortOrder, null)`. A run
+  that never throws also leaves `sortOrder` null, so the test cannot tell "rejected duplicate sort
+  column" from "returned null". Use `assertThrows(DdlException.class, ...)`.
+- `fe/fe-core/src/test/java/com/starrocks/journal/bdbje/BDBEnvironmentTest.java:247-252` —
+  `assertTrue(true)` plus a `catch (JournalException e) { LOG.warn(...) }` around the `setup(true)`
+  that the comment says "will get rollback exception"; if it does not throw, the test still passes.
+
+**False-positive classes confirmed during this scan** (already covered by the NOT-a-bug list, keep
+excluding them): reflexivity/`hashCode`-stability checks in `equals` contract tests
+(`assertEquals(x, x)`, `assertEquals(x.hashCode(), x.hashCode())`); determinism checks that call the
+same producer twice on purpose (`assertArrayEquals(digestOf(sql), digestOf(sql))`,
+`ConstantOperatorTest` folding a binary twice); `assertTrue(true)` in tests whose comment states the
+intent is "reached here without throwing" (`OAuth2Test`, `TabletSchedulerTest`,
+`OdpsCacheUpdateProcessorTest`, `FrontendServiceImplDeadlockTest`); `assertNotNull(new Foo())` written
+as deliberate constructor coverage (`UpdatePlanTest:606`); and the StarRocks `assertEquals(1, 2)` /
+`assertEquals(1, 1)` fail/pass-marker idiom in try-catch blocks (works correctly — the `(1, 2)` in
+the `try` is the real failure trigger — but `fail()` / `assertThrows` reads better).
+
+**Shape 4 (duplicated case) — no confirmed instance in `fe/`.** A repo-scale detector for it is
+dominated by intentional near-duplicates: cases whose only difference is one constant inside a
+multi-line SQL string or one constructor argument (`MaterializedViewTest` "test int type" vs "test
+date type", `ColumnDefTest.testAutoIncrement`, `PublishVersionDaemonTest.testInvalidInitConfiguration`).
+Scan for this shape per-file, not repo-wide, and require the *distinguishing* constant of the case —
+not just the assertions around it — to be identical.
