@@ -27,6 +27,22 @@ exercise the thing its comment / method name claims. Four concrete shapes:
    the test *should* be pinning (a sign the arguments got shifted one slot). Watch JUnit's argument
    order — `assertEquals(expected, actual, delta)`; tests that pass the *actual* first are exactly
    the ones that end up with the real expected value sitting in the `delta` slot.
+
+   **Two distinct origins, worth telling apart — the fix differs:**
+   - *An argument-order refactor that was only half applied.* Rewriting `assertEquals(X, 1)` into
+     `assertEquals(1, X)` means prepending `1,` **and** deleting the trailing `, 1`; skip the
+     deletion and the expected value silently becomes a delta. The tell is decisive: **the same
+     commit usually contains sibling lines that were converted correctly**, so `git log -S` on the
+     assertion text hands you the intended expected value instead of making you derive it. (Traced
+     for `CreateMaterializedViewTest:674`: introduced reversed-but-exact by StarRocks #6844, broken
+     by the argument-order pass in #7755, carried through the JUnit 5 migration in #60389 — three
+     years unnoticed, because a bulk `Assert.` → `Assertions.` rename never inspects arity.)
+   - *A delta inflated step by step to keep a wrong expected value passing.* Here the expected value
+     itself is wrong, and each time reality drifted further the author widened the delta instead of
+     recomputing. The tell is a **monotone series**: sibling cases sharing one formula whose deltas
+     grow (`0.001` → `0.01` → `1`) exactly as the computed value moves away from what is asserted.
+     Tightening the delta alone turns the test red — the expected value has to be recomputed too.
+     (See `ExpressionStatisticsCalculatorTest` in the scan results below.)
 3. **Wrong constant/enum, so the named subject is never exercised** — a case commented
    `// test dayofmonth function` that constructs the operator with `FunctionSet.DAY`, a
    `testXxxNullable` that passes the non-nullable type, a parameterized case whose parameter
@@ -65,6 +81,22 @@ value with a tight delta (compute it once by hand and hardcode it), put `expecte
 argument slot, fix the constant so the named function is really exercised, and delete the duplicate
 block rather than keeping it as "extra coverage".
 
+**Before you rewrite a swallowing `catch` into `assertThrows`, prove the throw is reachable.**
+An empty or vacuous `catch` hides *which* of two facts is true: "the call throws and we ignore it",
+or "the call never throws at all". Reading the production method only tells you what happens **if**
+control reaches the throwing statement; a unit-test harness often short-circuits before that. Check
+the guards the method opens with, and check what the test's base class actually starts — a test that
+extends a base which spins up no cluster, no catalog and no session leaves early-exit branches
+(`isForwardToLeader()`, `isEmpty()`, `!isInitialized()`) taking the path you did not read. When you
+cannot establish it from the code, run the test before rewriting, or assert the weaker fact you do
+have evidence for (`assertDoesNotThrow`, the returned value) rather than a throw you assumed.
+A wrong `assertThrows` fails loudly, which is recoverable — but it burns a CI round and, worse,
+invites "fixing" it back into something vacuous.
+
+Corollary: when a method's **name** promises the exception (`testFooWithException`) and the body
+turns out never to throw, the name is itself an instance of shape 3 — rename it to what the test
+actually pins, or the next reader re-introduces the same wrong assumption.
+
 **Reference fix — StarRocks PR #78430** (https://github.com/StarRocks/starrocks/pull/78430):
 `ExpressionStatisticsCalculatorTest.testUnaryFunctionCall()` contained all four shapes at once — a
 self-comparison for `from_unixtime`, a delta of `128` on a value of `128` for `ascii`, a case
@@ -89,7 +121,10 @@ callOperator = new CallOperator(FunctionSet.DAYOFMONTH, FloatType.DOUBLE, Lists.
 ```
 
 **Candidate instances found by this rule** (scan of `fe/` test sources @ `d4bbe0d9943`, 2026-09-14).
-All are **unfixed**; line numbers are at that commit.
+Line numbers are at that commit. All were fixed in **StarRocks PR #79094**
+(https://github.com/StarRocks/starrocks/pull/79094); the entries below are the findings **as first
+reported**, and the "Corrections" block at the end of this list records where fixing them proved the
+first read wrong. Read both — the corrections are the part with teaching value.
 
 *Shape 1 — assertion compares a constant to itself, so the real value is never checked:*
 - `fe/fe-core/src/test/java/com/starrocks/service/InformationSchemaDataSourceTest.java:509-511` —
@@ -148,6 +183,30 @@ fail? none" test, worth folding into TEST-001 when scanning):
 - `fe/fe-core/src/test/java/com/starrocks/journal/bdbje/BDBEnvironmentTest.java:247-252` —
   `assertTrue(true)` plus a `catch (JournalException e) { LOG.warn(...) }` around the `setup(true)`
   that the comment says "will get rollback exception"; if it does not throw, the test still passes.
+
+**Corrections that only surfaced while fixing these** (each one is a way the *scan* was wrong, not
+the code):
+- `StmtExecutorNewTest` — reported as "catch asserts `assertTrue(true)`, so both outcomes pass".
+  True, but I then rewrote it to assert the `AnalysisException` that `generateExecPlan()` produces
+  for an unknown table, and the test failed: *nothing is thrown*. `StmtExecutorNewTest` extends a
+  base class that starts no cluster, so the FE is not the leader, `generateExecPlan()` takes its
+  `if (!isForwardToLeader())` early exit, and the planner is never reached. Of the method's two
+  contradictory comments ("should not throw" / "exception is expected") the **first** was right.
+  This is what the reachability warning above was written from.
+- `ExpressionStatisticsCalculatorTest` — reported as LOW, "delta `1` where neighbours use `0.01`".
+  Understated. Computing `(left.min - right.max) / interval = -300 / interval` showed the asserted
+  expected value of `0` is itself wrong for `hours_diff` (`-0.0833`) *and* for `days_diff` /
+  `datediff` (`-0.0035`, delta `0.01` — a pair the scan did not even flag). A delta that looks
+  merely loose is worth recomputing: it may be load-bearing.
+- `IcebergApiConverterTest` — reported as "cannot tell a thrown `DdlException` from a `null`
+  return". Overstated: the following `assertEquals(sortOrder, null)` does catch a non-null return,
+  so the gap is only that the exception's type and message go unpinned. Read the lines *after* the
+  catch before calling a block vacuous.
+- `BDBEnvironmentTest` — reported as "the expected rollback exception is only logged, not asserted".
+  Wrong: the method's javadoc states both outcomes are acceptable, and the narrow
+  `catch (JournalException)` already fails the test if a raw `RollbackException` escapes. Only the
+  stray `assertTrue(true)` was real. **Read the javadoc before calling a permissive catch a bug**;
+  some are deliberate, and "fixing" them into `assertThrows` manufactures flakiness.
 
 **False-positive classes confirmed during this scan** (already covered by the NOT-a-bug list, keep
 excluding them): reflexivity/`hashCode`-stability checks in `equals` contract tests
