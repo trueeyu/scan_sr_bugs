@@ -21,8 +21,9 @@ and pattern-based rules. Output a structured report of findings.
 1. **Read the file** at the given path (use `bash_tool` with `cat` or `view` tool).
 2. **Identify the language** (C++ if `.cpp/.h/.cc`, Java if `.java`).
 3. **Load the relevant rules** from `references/rules_cpp.md` or `references/rules_java.md` (plus
-   `references/rules_common.md` for rules that apply to both, and `references/rules_optimizer.md`
-   for StarRocks FE optimizer files). See the Rules Loading Guide below.
+   `references/rules_common.md` for rules that apply to both, `references/rules_optimizer.md` for
+   StarRocks FE optimizer files, and `references/rules_test.md` for test files). See the Rules
+   Loading Guide below.
 4. **Scan the file** by reading its content carefully and applying each rule.
 5. **Output the report** in the structured format below.
 
@@ -75,6 +76,10 @@ If no issues are found, output:
 - Always load `references/rules_common.md` regardless of language.
 - For C++ files: also load `references/rules_cpp.md`
 - For Java files: also load `references/rules_java.md`
+- For **test** files (`*Test.java`, `*Tests.java`, `*_test.cpp`, `*_test.cc`, or any path under
+  `src/test/`, `fe/fe-core/src/test/`, `be/test/`): also load `references/rules_test.md`
+  (`TEST-NNN`), *in addition to* the common and language rules — a test file can carry ordinary bugs
+  too.
 - For StarRocks FE **optimizer** Java files (path under `com.starrocks.sql.optimizer` or
   `com.starrocks.qe.feedback`, e.g. operators, rewrite rules, tree rewrites, plan tuning guides):
   also load `references/rules_optimizer.md` (`OPT-NNN`).
