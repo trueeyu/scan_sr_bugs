@@ -14,13 +14,10 @@ language-specific rules (a test file can of course also leak resources, overflow
 **Severity**: MEDIUM
 
 **Pattern**: An assertion is syntactically present but has no power to fail, or the case does not
-exercise the thing its comment / method name claims. Four concrete shapes:
+exercise the thing its comment / method name claims. Three concrete shapes (an assertion whose
+expected and actual are the same value is split out as TEST-003):
 
-1. **Self-comparison** — the same expression is passed as both expected and actual:
-   `assertEquals(x.getCount(), x.getCount(), 0.001)`, `EXPECT_EQ(v.size(), v.size())`. Always true
-   regardless of what the code under test computes. Usually a copy-paste left behind while filling
-   in an "expected" slot the author had not computed yet.
-2. **Tolerance/delta wide enough to swallow the value** — a floating-point assertion whose `delta`
+1. **Tolerance/delta wide enough to swallow the value** — a floating-point assertion whose `delta`
    is the same order of magnitude as (or larger than) the expected value:
    `assertEquals(actual, 10, 128)` accepts anything in `[-118, 138]`; `EXPECT_NEAR(a, b, 1e9)`.
    Rule of thumb: flag when `delta >= |expected| / 2`, or when `delta` happens to equal the value
@@ -44,31 +41,25 @@ exercise the thing its comment / method name claims. Four concrete shapes:
      Tightening the delta alone turns the test red — the expected value has to be recomputed too.
      (Fixed in `ExpressionStatisticsCalculatorTest` by PR #79094: `hours_diff` / `days_diff` /
      `datediff` asserted `0` where the calculator returns `-0.0833` / `-0.0035`.)
-3. **Wrong constant/enum, so the named subject is never exercised** — a case commented
+2. **Wrong constant/enum, so the named subject is never exercised** — a case commented
    `// test dayofmonth function` that constructs the operator with `FunctionSet.DAY`, a
    `testXxxNullable` that passes the non-nullable type, a parameterized case whose parameter
    duplicates a sibling's. The assertions may be fine; the *input* is wrong, so the intended branch
    has zero coverage while looking covered. Cross-check every case comment / test-method name
    against the constant actually passed.
-4. **Duplicated case** — two blocks in the same test method with identical setup and identical
+3. **Duplicated case** — two blocks in the same test method with identical setup and identical
    assertions (e.g. `FunctionSet.RAND` asserted twice with the same bounds). Costs runtime, and
    hides the fact that a *different* intended case was meant to be there.
 
 **Common unsafe patterns to flag**:
-- `assertEquals(a, a, ...)`, `assertTrue(true)`, `assertNotNull(new Foo())`, `EXPECT_EQ(x, x)`.
+- `assertTrue(true)`, `assertFalse(false)`, `assertNotNull(new Foo())` — true by construction.
 - `assertEquals(<call>, <literal>, <literal>)` where the third literal is larger than the second —
   almost certainly the expected/actual/delta slots got shifted.
-- An assertion whose expected value is produced by re-calling the code under test
-  (`assertEquals(calculate(op, stats).getMin(), columnStatistic.getMin())`) — this tests the function
-  against itself and passes even when it is uniformly wrong.
 - `try { call(); fail("should throw"); } catch (Exception e) { }` where the call before `fail()`
   cannot throw, or where the `catch` is broad enough to swallow the `AssertionError` that `fail()`
   itself raises (`catch (Throwable)` / `catch (Error)` after `fail()` is always vacuous).
 - A `catch` whose body is an always-true assertion — `catch (Exception e) { assertFalse(false); }`,
   `catch (...) { assertTrue(true); }` — so both "threw" and "did not throw" pass.
-- A comparison of two calls in one expression meant to check stability over time
-  (`assertEquals(lock.getHeldTimeNs(), lock.getHeldTimeNs())` under "after close() the total is
-  stable") — snapshot, wait, then compare.
 - An assertion placed after an unconditional `return`/`break`, or inside a loop over a collection
   that is empty in the fixture — present in the source, never executed.
 
@@ -76,10 +67,6 @@ exercise the thing its comment / method name claims. Four concrete shapes:
 - A deliberately loose bound documented as such (a timing / heuristic / statistics estimate where the
   test asserts only a range and the delta is clearly narrower than the value being pinned).
 - Smoke tests that assert only "does not throw", when that is the stated intent.
-- `assertEquals(x.foo(), y.foo())` on two *different* objects — that is a real equivalence check.
-- Reflexivity / `hashCode`-stability checks in `equals` contract tests (`assertEquals(x, x)`,
-  `assertEquals(x.hashCode(), x.hashCode())`), and determinism checks that call the same producer
-  twice on purpose (`assertArrayEquals(digestOf(sql), digestOf(sql))`, folding a constant twice).
 - `assertTrue(true)` where the comment states the intent is "reached here without throwing", and
   `assertNotNull(new Foo())` written as deliberate constructor coverage.
 - The StarRocks `assertEquals(1, 2)` / `assertEquals(1, 1)` fail/pass-marker idiom inside
@@ -90,8 +77,7 @@ exercise the thing its comment / method name claims. Four concrete shapes:
   flakiness.
 
 **Natural language**: For each assertion, ask *"what change to the production code would make this
-fail?"* If the answer is "none", flag it. Concretely: compare the expected and actual expressions
-for textual identity; compare any float delta against the magnitude of the expected value; match each
+fail?"* If the answer is "none", flag it. Concretely: compare any float delta against the magnitude of the expected value; match each
 case's comment / method name against the enum, constant, or type it actually passes; then scan the
 method for two blocks with identical setup+assertions. Suggested fix: assert the concrete expected
 value with a tight delta (compute it once by hand and hardcode it), put `expected` in the first
@@ -111,19 +97,12 @@ A wrong `assertThrows` fails loudly, which is recoverable — but it burns a CI 
 invites "fixing" it back into something vacuous.
 
 Corollary: when a method's **name** promises the exception (`testFooWithException`) and the body
-turns out never to throw, the name is itself an instance of shape 3 — rename it to what the test
+turns out never to throw, the name is itself an instance of shape 2 — rename it to what the test
 actually pins, or the next reader re-introduces the same wrong assumption.
 
-**Reference fix — StarRocks PR #78430** (https://github.com/StarRocks/starrocks/pull/78430):
-`ExpressionStatisticsCalculatorTest.testUnaryFunctionCall()` contained all four shapes at once — a
-self-comparison for `from_unixtime`, a delta of `128` on a value of `128` for `ascii`, a case
-commented "test dayofmonth function" that passed `FunctionSet.DAY`, and `rand` covered twice with
-identical setup.
+**Reference fix**: StarRocks PR #78430 — [UT] Fix ineffective assertions in ExpressionStatisticsCalculatorTest (https://github.com/StarRocks/starrocks/pull/78430)
 
-**Found by this rule** — StarRocks PR #79094 (https://github.com/StarRocks/starrocks/pull/79094):
-a scan of all ~2000 `fe/` test sources fixed 15 sites in 13 files — three self-comparisons, five
-over-wide float deltas, six tests made unfailable by their `catch` block — plus three assertions whose
-**expected value was itself wrong**, kept green only by an inflated delta.
+**Found by this rule**: StarRocks PR #79094 — [UT] Fix assertions that cannot fail across FE tests (https://github.com/StarRocks/starrocks/pull/79094)
 
 **Lessons from fixing the findings** (each is a way a first read of a finding was wrong):
 - **A delta that looks merely loose may be load-bearing.** Recompute the expected value from the
@@ -137,7 +116,7 @@ over-wide float deltas, six tests made unfailable by their `catch` block — plu
 - **Prove the throw is reachable** before rewriting into `assertThrows` (see the warning above) —
   a test on a base class with no cluster took an early-exit branch and never threw.
 
-**Scanning shape 4 (duplicated case):** do it per file, not repo-wide. A repo-scale detector is
+**Scanning shape 3 (duplicated case):** do it per file, not repo-wide. A repo-scale detector is
 swamped by intentional near-duplicates whose only difference is one constant inside a multi-line SQL
 string or one constructor argument; require the *distinguishing* constant of the case — not just the
 assertions around it — to be identical.
@@ -175,7 +154,8 @@ modes, all timing-dependent:
    thread makes it. A daemon calling `db.isSystemDatabase()` during recording silently adds an
    expectation with the default `minTimes = 1`; the test itself never makes that call, so
    verification fails with `Missing 1 invocation to: ...Database#isSystemDatabase()`, stack in the
-   daemon (`TabletChecker.checkOneDatabase`, `LeaderDaemon.loop`). A second signature of the same
+   daemon (`TabletChecker.checkOneDatabase`, `LeaderDaemon.loop`). `minTimes = 0` on the calls the
+   test records does not help: the leaked call is one the author never wrote. A second signature of the same
    race: `ConcurrentModificationException at mockit.internal.expectations.state.ExecutingTest
    .addInjectableMock` thrown from the Expectations constructor — two threads touching the mock
    registry at once. It is not "a JMockit bug"; it is this rule.
@@ -274,22 +254,67 @@ StarRocks) — and the test no longer covers what it claims. After each swap, pr
 fail: break the recorded `result` or the branch under test and watch it go red. New tests should
 default to `@Injectable` and use `@Mocked` only with a comment naming what it must intercept.
 
-**Reference fix — StarRocks PR #79915** (https://github.com/StarRocks/starrocks/pull/79915):
-`ColocateTableIndexTest` starts a full FE in `@BeforeEach`; the three
-`testAfterTabletCreationRouting*` cases took `@Mocked Database db, @Mocked OlapTable/LakeTable`. When
-`TabletChecker.checkOneDatabase()` called `db.isSystemDatabase()` on a real database while the
-`Expectations` block was recording, JMockit recorded it with `minTimes = 1`, and the test failed
-intermittently with `Missing 1 invocation to: com.starrocks.catalog.Database#isSystemDatabase()`,
-caused by `TabletChecker.checkOneDatabase(TabletChecker.java:317)` ← `LeaderDaemon.loop`. Note every
-recorded call in the test already had `minTimes = 0` — it did not help. The fix switched the three
-cases to `@Injectable`, safe here because the mocks are passed straight into `addTableToGroup()`.
+**Reference fix**: StarRocks PR #79915 — [UT] Fix flaky ColocateTableIndexTest afterTabletCreation routing cases (https://github.com/StarRocks/starrocks/pull/79915)
 
-**Earlier fixes of the same bug class** (from `git log` — the pattern recurs, and
-each was fixed one file at a time): #64772 removed `@Mocked Database` from
-`AlterTableOperationStmtTest` (same TabletChecker path as #79915); #8951 and #66178 removed
-`@Mocked GlobalStateMgr` from `RefreshTableStmtTest` / `IcebergHiveCatalogTest`; #69036 replaced
-partial-mock `new Expectations(getNodeMgr())` in `IcebergMetadataTest` with `MockUp`s; #70316
-replaced `@Mocked GlobalStateMgr` + `times =` in `StmtExecutorTest` with a `MockUp` guarded by
-`Thread.currentThread() != testThread`; #33345, #60796, #67416, #67526 stopped `ColocateTableBalancerTest`'s
-interfering daemons one at a time; #73662 / #78742 stubbed or quiesced the 10 ms `TabletReshardJobMgr`
-daemon for reshard tests.
+**Earlier fixes of the same bug class**:
+- StarRocks PR #64772 — [UT] Fix unstable UT (https://github.com/StarRocks/starrocks/pull/64772)
+- StarRocks PR #8951 — [others] Fix unstable RefreshTableStmtTest (https://github.com/StarRocks/starrocks/pull/8951)
+- StarRocks PR #66178 — [UT] Fix unstable UT in IcebergHiveCatalogTest (https://github.com/StarRocks/starrocks/pull/66178)
+- StarRocks PR #69036 — [UT] Fix unstable UT (https://github.com/StarRocks/starrocks/pull/69036)
+- StarRocks PR #70316 — [UT] Fix forwardToLeader unstable UT (https://github.com/StarRocks/starrocks/pull/70316)
+- StarRocks PR #33345 — [UT] Fix unstable ut for colocate balancer (https://github.com/StarRocks/starrocks/pull/33345)
+- StarRocks PR #60796 — [UT] fix unstable ColocateTableBalancerTest (https://github.com/StarRocks/starrocks/pull/60796)
+- StarRocks PR #67416 — [UT] Fix ColocateTableBalancer unstable UT (https://github.com/StarRocks/starrocks/pull/67416)
+- StarRocks PR #67526 — [UT] Fix ColocateTableBalancer unstable UT (https://github.com/StarRocks/starrocks/pull/67526)
+- StarRocks PR #73662 — [UT] Stub ColocateChecker daemon in SplitTabletJobColocateTest (https://github.com/StarRocks/starrocks/pull/73662)
+- StarRocks PR #78742 — [UT] Quiesce the reshard leader daemon in TabletReshardJobMgrTest (https://github.com/StarRocks/starrocks/pull/78742)
+
+---
+
+## TEST-003 — Self-Comparison Assertion (Expected and Actual Are the Same Value)
+**Severity**: MEDIUM (LOW for the stability-over-time variant)
+
+**Pattern**: The expected and the actual argument of an equality assertion are the same value, so it
+is true whatever the code under test computes. The code under test may never be checked at all —
+the assertion *looks* like coverage. Four variants:
+
+1. **Same expression twice** — `assertEquals(x.getCount(), x.getCount(), 0.001)`,
+   `EXPECT_EQ(v.size(), v.size())`.
+2. **Literal compared to itself** — `assertEquals("NO", "NO", "isGrantable should be NO")`,
+   `assertEquals(true, true)`.
+3. **Expected value computed by the code under test** — `assertEquals(calculate(op, stats).getMin(),
+   columnStatistic.getMin())`, where `columnStatistic` also came from `calculate(op, stats)`. Both
+   sides are the same function's output, so the assertion passes even when `calculate()` is wrong.
+4. **Two calls in one expression meant to check stability over time** —
+   `assertEquals(lock.getHeldTimeNs(), lock.getHeldTimeNs())` under "after close() the total is
+   stable". Both calls run back-to-back, so a counter that is still ticking slowly is not caught.
+
+**Common unsafe patterns to flag**:
+- `assertEquals(E, E[, ...])` / `assertSame(E, E)` / `EXPECT_EQ(E, E)` / `ASSERT_EQ(E, E)` where both
+  arguments are textually identical after trimming whitespace — including two identical literals.
+- An expected argument computed by calling the same method (or the same helper) as the actual one,
+  on the same inputs.
+- A self-comparison whose sibling assertions in the same block all check a getter on the object under
+  test (`assertEquals("admin", role.getUser()); assertEquals("NO", "NO");`) — the sibling lines tell
+  you the intended getter.
+
+**NOT a bug** (do not flag):
+- `assertEquals(x.foo(), y.foo())` on two *different* objects — a real equivalence check.
+- Reflexivity / `hashCode`-stability checks in `equals` contract tests (`assertEquals(x, x)`,
+  `assertEquals(x.hashCode(), x.hashCode())`) — the contract *is* self-comparison.
+- Determinism checks that call the same producer twice on purpose
+  (`assertArrayEquals(digestOf(sql), digestOf(sql))`, folding a constant twice) — two separate
+  computations, and the comment or method name says determinism is the point.
+- The StarRocks fail/pass-marker idiom `assertEquals(1, 1)` in a try/catch (see TEST-001's NOT a bug
+  list) — a marker, not a check of the code under test.
+
+**Natural language**: For each hit, ask *"which value did the author mean to check?"* — look at the sibling assertions in the same block,
+the assertion message, the variable assigned just before, and `git log -S` on the line. Suggested fix:
+put the concrete expected value (computed by hand, hardcoded) in the first slot and the real getter
+in the second; for the stability variant, snapshot the value, wait or do the operation that must not
+change it, then compare against the snapshot. If the missing getter reveals an unchecked field (e.g.
+three columns of a system table nobody asserts), say so — that uncovered path is the real finding.
+
+**Reference fix**: StarRocks PR #78430 — [UT] Fix ineffective assertions in ExpressionStatisticsCalculatorTest (https://github.com/StarRocks/starrocks/pull/78430)
+
+**Found by this rule**: StarRocks PR #79094 — [UT] Fix assertions that cannot fail across FE tests (https://github.com/StarRocks/starrocks/pull/79094)
