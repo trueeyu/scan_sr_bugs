@@ -119,23 +119,6 @@ actually pins, or the next reader re-introduces the same wrong assumption.
 self-comparison for `from_unixtime`, a delta of `128` on a value of `128` for `ascii`, a case
 commented "test dayofmonth function" that passed `FunctionSet.DAY`, and `rand` covered twice with
 identical setup.
-```java
-// BEFORE (buggy)
-// ascii: assertEquals(expected, actual, delta) — args shifted, delta 128 accepts [-118, 138]
-Assertions.assertEquals(columnStatistic.getDistinctValuesCount(), 10, 128);
-// from_unixtime: compares the value to itself, cannot fail
-Assertions.assertEquals(columnStatistic.getDistinctValuesCount(), columnStatistic.getDistinctValuesCount(), 0.001);
-// "test dayofmonth function" — but DAY is passed, so dayofmonth is never exercised
-callOperator = new CallOperator(FunctionSet.DAY, FloatType.DOUBLE, Lists.newArrayList(columnRefOperator));
-// duplicate of the RAND case a few lines above: identical setup and assertions
-callOperator = new CallOperator(FunctionSet.RAND, FloatType.DOUBLE, Lists.newArrayList(columnRefOperator));
-
-// AFTER (fixed)
-Assertions.assertEquals(128, columnStatistic.getDistinctValuesCount(), 0.001);
-Assertions.assertEquals(100, columnStatistic.getDistinctValuesCount(), 0.001);
-callOperator = new CallOperator(FunctionSet.DAYOFMONTH, FloatType.DOUBLE, Lists.newArrayList(columnRefOperator));
-// duplicate RAND block deleted
-```
 
 **Found by this rule** — StarRocks PR #79094 (https://github.com/StarRocks/starrocks/pull/79094):
 a scan of all ~2000 `fe/` test sources fixed 15 sites in 13 files — three self-comparisons, five
@@ -298,22 +281,8 @@ default to `@Injectable` and use `@Mocked` only with a comment naming what it mu
 `Expectations` block was recording, JMockit recorded it with `minTimes = 1`, and the test failed
 intermittently with `Missing 1 invocation to: com.starrocks.catalog.Database#isSystemDatabase()`,
 caused by `TabletChecker.checkOneDatabase(TabletChecker.java:317)` ← `LeaderDaemon.loop`. Note every
-recorded call in the test already had `minTimes = 0` — it did not help.
-```java
-// BEFORE (flaky) — @Mocked replaces Database in every thread, including TabletChecker
-@Test
-public void testAfterTabletCreationRoutingForNonLakeTable(
-        @Mocked Database db, @Mocked OlapTable olapTable) throws Exception {
-    new Expectations() {{
-        db.getId(); result = 100L; minTimes = 0;
-        ...
-    }};
-
-// AFTER (fixed) — @Injectable mocks only the instances passed to addTableToGroup()
-@Test
-public void testAfterTabletCreationRoutingForNonLakeTable(
-        @Injectable Database db, @Injectable OlapTable olapTable) throws Exception {
-```
+recorded call in the test already had `minTimes = 0` — it did not help. The fix switched the three
+cases to `@Injectable`, safe here because the mocks are passed straight into `addTableToGroup()`.
 
 **Earlier fixes of the same bug class** (from `git log` — the pattern recurs, and
 each was fixed one file at a time): #64772 removed `@Mocked Database` from
