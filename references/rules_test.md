@@ -232,3 +232,97 @@ multi-line SQL string or one constructor argument (`MaterializedViewTest` "test 
 date type", `ColumnDefTest.testAutoIncrement`, `PublishVersionDaemonTest.testInvalidInitConfiguration`).
 Scan for this shape per-file, not repo-wide, and require the *distinguishing* constant of the case —
 not just the assertions around it — to be identical.
+
+---
+
+## TEST-002 — Class-Wide Mock Leaking Into Live Background Threads (Flaky Test)
+**Severity**: MEDIUM
+
+**Pattern**: A test uses a mock that replaces the behaviour of **every instance of a type, in every
+thread** — JMockit `@Mocked`, `@Capturing`, a `new MockUp<T>() {...}` on an instance method, Mockito
+`mockStatic` / `mockConstruction` — while the same JVM is running real background threads that also
+touch that type. The typical source of those threads in StarRocks FE is a live cluster started in
+`@BeforeEach` / `@BeforeAll` (`UtFrameUtils.createMinStarRocksCluster()`, `PseudoCluster`,
+`StarRocksAssert` on a started FE): it starts the `LeaderDaemon`s — `TabletChecker`,
+`TabletScheduler`, `ColocateTableBalancer`, `DynamicPartitionScheduler`, statistics / MV refresh
+schedulers, `ReportHandler` — which periodically walk every `Database` and `Table` in the catalog.
+
+The test is green most runs and red when a daemon tick happens to land inside the mock's scope.
+Three ways it goes wrong, all timing-dependent:
+
+1. **Background call recorded as an expectation.** JMockit treats every call on a `@Mocked` type made
+   *while the `new Expectations() {{ ... }}` block is executing* as part of the recording, whatever
+   thread makes it. A daemon calling `db.isSystemDatabase()` during recording silently adds an
+   expectation with the default `minTimes = 1`; the test itself never makes that call, so
+   verification fails with `Missing 1 invocation to: ...Database#isSystemDatabase()`, and the stack
+   trace points into the daemon (`TabletChecker.checkOneDatabase`, `LeaderDaemon.loop`), not the test.
+2. **Background calls break strict counts.** `times = 1` / `maxTimes` / `FullVerifications` /
+   `verify(mock, times(n))` counts calls from all threads; a daemon adds extra ones →
+   `Unexpected invocation` / `TooManyActualInvocations`.
+3. **The daemon receives mock results.** Mocked methods return `0` / `null` / `false` / empty
+   collections to the daemon too, so it throws (NPE inside the scheduler) or mutates shared catalog
+   state based on nonsense — a failure that may surface in a *later* test in the same class.
+
+**Common unsafe patterns to flag**:
+- A test class whose `@BeforeEach` / `@BeforeAll` starts a cluster (`createMinStarRocksCluster`,
+  `PseudoCluster.getOrCreate`, `UtFrameUtils.startFEServer`) **and** a test method or field with
+  `@Mocked` / `@Capturing` on a type the daemons iterate: `Database`, `OlapTable`, `Table`,
+  `Partition`, `MaterializedIndex`, `LocalTablet`, `Replica`, `GlobalStateMgr`, `LocalMetastore`,
+  `SystemInfoService`, `TabletInvertedIndex`, `ColocateTableIndex`.
+- Same, with an `Expectations` block that does not put `minTimes = 0` on every recorded call — and
+  note that `minTimes = 0` on the recorded calls does **not** protect against shape 1: the leaked call
+  is one the author never wrote.
+- A `MockUp<T>` on an instance method of one of those types installed in a class with a live cluster,
+  without `tearDown()` — it is global and survives into the daemons for the rest of the class.
+- The flake signature itself, when reviewing a CI failure: a JMockit `Missing invocation` /
+  `Unexpected invocation` whose `Caused by` stack is in a daemon thread rather than the test method.
+
+**NOT a bug** (do not flag):
+- `@Mocked` on a type no background thread touches, or on a type whose only real instances would be
+  created by the test (e.g. `@Mocked LakeTable` in a shared-nothing cluster that holds no lake
+  tables — risky in principle, not flaky in practice; LOW at most).
+- Test classes that start no cluster and no daemon thread (plain unit tests on hand-built objects).
+- `@Injectable` mocks, and Mockito `mock(Foo.class)` — both mock only the one instance handed to
+  the code under test.
+- A class-wide mock that is *the point* of the test (intercepting a call the code under test makes
+  on an object it constructs internally), as long as the class starts no daemons.
+
+**Natural language**: For each mock, ask *"does this replace one object, or the whole type?"* If
+the whole type, ask *"is any other thread in this JVM using that type right now?"* — check what
+`@BeforeEach` / `@BeforeAll` / the base class starts. If both answers are yes, the test is flaky.
+Suggested fix, in order of preference: use `@Injectable` (JMockit) or a plain `mock()` (Mockito) so
+only the instance passed in is mocked; failing that, build a real object (`new Database(id, name)`)
+instead of mocking; failing that, move the case to a test class that starts no cluster. Do not "fix"
+it by adding `minTimes = 0` to the recorded calls or by stopping one named daemon — the next daemon
+or the next method it calls re-opens the race.
+
+**Reference fix — StarRocks PR #79915** (https://github.com/StarRocks/starrocks/pull/79915):
+`ColocateTableIndexTest` starts a full FE in `@BeforeEach`; the three
+`testAfterTabletCreationRouting*` cases took `@Mocked Database db, @Mocked OlapTable/LakeTable`. When
+`TabletChecker.checkOneDatabase()` called `db.isSystemDatabase()` on a real database while the
+`Expectations` block was recording, JMockit recorded it with `minTimes = 1`, and the test failed
+intermittently with `Missing 1 invocation to: com.starrocks.catalog.Database#isSystemDatabase()`,
+caused by `TabletChecker.checkOneDatabase(TabletChecker.java:317)` ← `LeaderDaemon.loop`. Note every
+recorded call in the test already had `minTimes = 0` — it did not help.
+```java
+// BEFORE (flaky) — @Mocked replaces Database in every thread, including TabletChecker
+@Test
+public void testAfterTabletCreationRoutingForNonLakeTable(
+        @Mocked Database db, @Mocked OlapTable olapTable) throws Exception {
+    new Expectations() {{
+        db.getId(); result = 100L; minTimes = 0;
+        ...
+    }};
+
+// AFTER (fixed) — @Injectable mocks only the instances passed to addTableToGroup()
+@Test
+public void testAfterTabletCreationRoutingForNonLakeTable(
+        @Injectable Database db, @Injectable OlapTable olapTable) throws Exception {
+```
+
+**Where to look next** (grep of `fe/fe-core/src/test` @ `233bc6a4b5e`, not yet triaged): 7 test files
+start a cluster *and* take `@Mocked` on one of `Database` / `GlobalStateMgr` / `OlapTable` /
+`LocalMetastore` / `Table` / `SystemInfoService` / `TabletInvertedIndex` — e.g.
+`IcebergMetadataTest` (`@Mocked LocalMetastore` at L3166, L3208, L3252). The remaining
+`@Mocked LakeTable` cases in `ColocateTableIndexTest` itself (L271, L332, L470, L561, L636, …) fall
+under the LOW "no real instances in a shared-nothing cluster" note above.
