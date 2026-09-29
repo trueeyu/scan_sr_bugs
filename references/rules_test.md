@@ -246,7 +246,7 @@ come from a live cluster (`UtFrameUtils.createMinStarRocksCluster()`, `PseudoClu
 catalog and the backend list.
 
 **Which mocks leak across threads** (JMockit 1.49 / Mockito 5, as used by `fe/`; verified against the
-JMockit jar during the scan below — get this right before flagging anything):
+JMockit jar — get this right before flagging anything):
 
 | Mock | Scope | Leaks into daemons? |
 |---|---|---|
@@ -292,6 +292,17 @@ modes, all timing-dependent:
   `FeConstants.runningUnitTest`; `StatisticsMetaManager` first acts ~60 s after FE start;
   `ConnectorTableMetadataProcessor` ticks every 10 min. Name the daemon, its interval, and the
   call path that reaches the mocked type — without that, it is not a finding.
+- A running daemon is not enough — **it must have work in this fixture that reaches the method**.
+  Most daemons iterate a job list, a transaction list or a queue: hand-built jobs (`new XxxJob(...)`,
+  factory-created) that were never registered with their manager are invisible to it;
+  `PublishVersionDaemon` idles without committed transactions (no loads → no work); the MV scheduler
+  idles when every MV is `REFRESH DEFERRED MANUAL`. Conversely, some daemons run on a very short tick
+  and execute the same code the test drives by hand — e.g. in shared-data the `TabletReshardJobMgr`
+  leader daemon ticks every **10 ms** and calls `colocateChecker.runOneCycle()` first.
+- Match the **exact overload** the mock replaces. A daemon calling a sibling method does not count:
+  `TxnTimeoutChecker` aborts via `DatabaseTransactionMgr.abortTransaction`, never the
+  `GlobalTransactionMgr.abortTransaction(long, long, String)` tests usually mock; background stats
+  queries use the 3-argument `StatementPlanner.plan`, not the 2-argument one.
 
 **Common unsafe patterns to flag**:
 - A live cluster (as established above) **plus** `@Mocked` / `@Capturing` on a type a *running*
@@ -305,6 +316,17 @@ modes, all timing-dependent:
   dummy calls after the assertions "to use up" leaked expectations
   (`getClusterInfo().getIdToBackend();` with no assignment); a comment blaming JMockit for a
   `ConcurrentModificationException`; stopping daemons one by one in `@BeforeAll`.
+- A `MockUp` (any mock scoped to the whole JVM) whose `@Mock` body has a **side effect the test
+  asserts on** — `count++`, `called = true`, `captured.add(arg)`, `lastArg = arg` — while a running
+  daemon also calls that method. This is mode 2 without JMockit's counting: the daemon's call mutates
+  the same variable. Two outcomes, both findings:
+  - *flaky-fail* — `assertEquals(1, count)`, `assertFalse(called)`, `assertEquals(expected, captured)`,
+    an asserted argument the daemon overwrote;
+  - *masked-pass* (LOW) — `assertTrue(called)`, `count >= 1`, `assertFalse(list.isEmpty())` are
+    *made true* by the daemon, so the test passes even if the code under test never makes the call:
+    the TEST-001 "cannot fail" problem, produced by concurrency. A comment such as "the background
+    scheduler may also tick, so the exact count is not asserted" is this shape admitted in writing —
+    the assertion was weakened instead of the daemon being stopped.
 - CI signature: JMockit `Missing invocation` / `Unexpected invocation` whose `Caused by` stack is in
   a daemon thread.
 
@@ -327,9 +349,21 @@ is mocked — **but first check how the code under test obtains the object**: if
 `GlobalStateMgr.getCurrentState().getXxx()` or reads real catalog replicas, `@Injectable` silently
 stops reaching it and the test breaks; then pair it with a `MockUp` of the single getter that hands
 it out (`MockUp<NodeMgr>.getClusterInfo()`), or set real state instead of mocking (row counts on real
-replicas, `new Database(id, name)`). Moving the case to a class with no cluster also works. Do not
-"fix" it with `minTimes = 0` on the recorded calls, a `Thread.sleep`, or stopping one named daemon —
-the next daemon re-opens the race.
+replicas, `new Database(id, name)`). Moving the case to a class with no cluster also works. For a
+side-effect `MockUp`, guard the side effect with `if (Thread.currentThread() == testThread)` (#70316)
+or filter on the argument the test cares about; when a whole class races one short-tick daemon, stop
+that daemon in `@BeforeAll` and wait for it to go quiet (`setStop()` + `awaitQuiesced`, #78742) and
+then restore exact assertions. Do not "fix" it with `minTimes = 0` on the recorded calls, a
+`Thread.sleep`, or by weakening the assertion — the next daemon re-opens the race.
+
+**`@Mocked` → `@Injectable` is safe only when the failure would be loud.** `@Injectable` stops
+mocking the other instances, the static methods and the constructors of the type. If the code under
+test reached the mock through one of those, the swap either fails loudly (an `Expectations` with the
+default `minTimes = 1` reports `Missing invocation` — fine, you will see it) or passes silently on
+the real code path (no `Expectations`, or every recorded call `minTimes = 0`, which is common in
+StarRocks) — and the test no longer covers what it claims. After each swap, prove the test can still
+fail: break the recorded `result` or the branch under test and watch it go red. New tests should
+default to `@Injectable` and use `@Mocked` only with a comment naming what it must intercept.
 
 **Reference fix — StarRocks PR #79915** (https://github.com/StarRocks/starrocks/pull/79915):
 `ColocateTableIndexTest` starts a full FE in `@BeforeEach`; the three
@@ -355,68 +389,12 @@ public void testAfterTabletCreationRoutingForNonLakeTable(
         @Injectable Database db, @Injectable OlapTable olapTable) throws Exception {
 ```
 
-**Earlier fixes of the same bug class** (found in `git log` during the scan — the pattern recurs, and
+**Earlier fixes of the same bug class** (from `git log` — the pattern recurs, and
 each was fixed one file at a time): #64772 removed `@Mocked Database` from
 `AlterTableOperationStmtTest` (same TabletChecker path as #79915); #8951 and #66178 removed
 `@Mocked GlobalStateMgr` from `RefreshTableStmtTest` / `IcebergHiveCatalogTest`; #69036 replaced
 partial-mock `new Expectations(getNodeMgr())` in `IcebergMetadataTest` with `MockUp`s; #70316
 replaced `@Mocked GlobalStateMgr` + `times =` in `StmtExecutorTest` with a `MockUp` guarded by
-`Thread.currentThread() != testThread`; #33345 and a series of later commits in
-`ColocateTableBalancerTest` (below).
-
-**Scan results** (`fe/` test sources @ `9a5c851e68b`, 2026-09-29). A regex pass found 141 live-cluster
-classes with a class-wide mock on a catalog/system type (601 sites, ~500 of them `MockUp`). The
-`@Mocked` / `@Capturing` / `mockStatic` subset — 33 files, ~95 sites — and 40 partial-mock
-`new Expectations(sharedObj)` sites on live singletons were triaged by hand.
-
-*PLAUSIBLE — confirmed in the past, mitigated today, not fixed:*
-- `fe/fe-core/src/test/java/com/starrocks/clone/ColocateTableBalancerTest.java` — 8 test methods
-  (L258, L361, L460, L586, L650, L754, L932, L1006) take `@Mocked SystemInfoService`,
-  `@Mocked Backend`, `@Mocked ClusterLoadStatistic` in a class that starts a shared-nothing cluster
-  (L136). Every symptom in this rule is in the file's history: a removed comment recording
-  `Missing 1 invocation to: SystemInfoService#getIdToBackend() ... at HeartbeatMgr
-  .runAfterCatalogReady`; a `ConcurrentModificationException at ExecutingTest.addInjectableMock`
-  blamed on JMockit and "fixed" with `Thread.sleep(2000)` **inside** the Expectations block (L364-376,
-  #33345); dummy `getIdToBackend()` / `getBackendIds()` calls at L451-453 to use up leaked
-  expectations; and `@BeforeAll` stopping HeartbeatMgr, TabletScheduler, TabletCollector, AlterJobMgr
-  and a MockUp'd TabletChecker one at a time (#60796, #67416, #67526). No short-interval daemon still
-  reaching `SystemInfoService` was found, so today it is LOW — but the next daemon added to the FE
-  re-opens it. Fix: `@Injectable`, plus `MockUp<NodeMgr>.getClusterInfo()` returning it for
-  `testOverallGroupBalance` / `testPerGroupBalance`, whose code under test fetches
-  `getClusterInfo()` itself; then delete the sleep and the dummy calls.
-- `fe/fe-core/src/test/java/com/starrocks/sql/plan/PlanFragmentWithCostTest.java:951` —
-  `@Mocked Replica` in a plan test. TabletChecker is starved (`tablet_sched_max_scheduling_tablets =
-  -1`), but `ColocateTableBalancer` (20 s) still walks the real replicas of PlanTestBase's
-  `colocate_t0` … tables via `TabletChecker.getColocateTabletHealthStatus` → `Replica.getBackendId()`.
-  LOW: mode 1 needs a 20 s tick to overlap a ~7-call recording. `@Injectable` would **break** it (the
-  planner reads real replicas); set row counts on the real replicas or `MockUp<Replica>.getRowCount`.
-
-*NOT a bug after triage — kept as calibration for the next scan:*
-- Persist-harness classes misread as live clusters: `CatalogRecycleBinTest`, `RoutineLoadJobTest`,
-  `RoutineLoadManagerTest`, `SharedDataStorageVolumeMgrTest`, `LocalMetastoreSimpleOpsEditLogTest`,
-  `GlobalTransactionMgrTest`, `ExportHandleTest`.
-- `@Mocked MetadataMgr` / `CatalogMgr` in 11 analyzer tests (`AlterTableOperationStmtTest`,
-  `UseDbStmtTest`, `HiveTableTest`, …): the only daemon path to them is `StatisticsMetaManager`
-  creating `_statistics_` tables once, ~60 s after FE start.
-- `@Mocked Table` (`AnalyzeTruncateTableTest`, `StmtExecutorTest:2152`), `@Mocked LakeTable` ×9 in
-  `ColocateTableIndexTest` (shared-nothing): exact-class matching, no real instances.
-- Live cluster, daemons do reach the mocked type, but no Expectations / Verifications and no
-  daemon-affected assertion: `KuduScanNodeTest:140`, `LakeTableHelperTest:127,177`,
-  `IcebergMetadataTest:3166,3208,3252`.
-- Mockito `mockStatic(GlobalStateMgr.class)` in `VacuumTest`, `LeaderOpExecutor*Test`,
-  `FrontendServiceImplTest`, `ExecPlanAIProviderTest`, `GlobalStateMgrTest:837` — thread-local.
-- Partial mocks of shared objects: `LimitTest:929` (`new Expectations(realReplica)` — TabletChecker
-  starved, `t0` not colocated); `ReportHandlerTest:284` (`times = 2` on the live
-  `ResourceUsageMonitor`, but its only other caller is `ReportHandler.handleReport` and the UT
-  `MockedBackend` sends no reports); the `StatisticStorage` / `IDictManager` partial mocks in plan
-  tests (no running daemon calls them).
-- `GlobalStateMgrTest:197` — no cluster *yet*: the only `createMinStarRocksCluster()` is in a method
-  JUnit orders 29th, this one runs 4th. Fragile to renames, not flaky today.
-
-*Not triaged:* the ~500 JVM-wide `MockUp<T>` sites (mode 3 only, so a finding needs a named
-corrupted assertion), and BE C++ tests (gmock has no class-wide mocking).
-
-*Adjacent issues seen, outside this rule:* `CatalogLevelTest:65,119` installs a `@Mocked MetadataMgr`
-globally with `setMetadataMgr()` and never restores it; `ColocateTableIndexTest` ~L285 installs a
-JVM-wide `MockUp<OlapTable>` (`isCloudNative = true`) that makes TabletChecker skip every real table
-while active.
+`Thread.currentThread() != testThread`; #33345, #60796, #67416, #67526 stopped `ColocateTableBalancerTest`'s
+interfering daemons one at a time; #73662 / #78742 stubbed or quiesced the 10 ms `TabletReshardJobMgr`
+daemon for reshard tests.
